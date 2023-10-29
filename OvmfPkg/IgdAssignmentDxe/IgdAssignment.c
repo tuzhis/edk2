@@ -35,8 +35,12 @@ typedef struct {
   UINTN  Bus;
   UINTN  Device;
   UINTN  Function;
+  UINTN  BDSMType;
   CHAR8  Name[sizeof "0000:00:02.0"];
 } CANDIDATE_PCI_INFO;
+
+#define BDSM_TYPE_GEN1 0x01
+#define BDSM_TYPE_GEN2 0x02
 
 //
 // selector and size of ASSIGNED_IGD_FW_CFG_OPREGION
@@ -113,6 +117,68 @@ InitPciInfo (
   return EFI_SUCCESS;
 }
 
+/**
+  Populate the BDSM address structure for a PciIo protocol instance.
+
+  @param[in] PciIo     EFI_PCI_IO_PROTOCOL instance to interrogate.
+
+  @param[out] PciInfo  CANDIDATE_PCI_INFO structure to fill.
+
+  @retval EFI_SUCCESS  PciInfo has been filled in. PciInfo->Name has been set
+                       to the empty string.
+
+  @return              Error codes from PciIo->Pci.Read() and
+                       PciIo->GetLocation(). The contents of PciInfo are
+                       indeterminate.
+**/
+
+STATIC
+EFI_STATUS
+InitBdsmInfo (
+  IN  EFI_PCI_IO_PROTOCOL *PciIo,
+  OUT CANDIDATE_PCI_INFO  *PciInfo
+  )
+{
+  EFI_STATUS Status;
+  // read host bdsmAddr
+  UINTN bdsmAddr2, bdsmAddr1;
+  Status = PciIo->Pci.Read (
+                    PciIo,
+                    EfiPciIoWidthUint16,
+                    ASSIGNED_IGD_PCI_BDSM2_OFFSET,
+                    2,                    // Count
+                    &bdsmAddr2
+                    );
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+  Status = PciIo->Pci.Read (
+                    PciIo,
+                    EfiPciIoWidthUint16,
+                    ASSIGNED_IGD_PCI_BDSM1_OFFSET,
+                    2,                    // Count
+                    &bdsmAddr1
+                    );
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+  if (bdsmAddr2 && bdsmAddr1) {
+    // this case should NEVER happen as device should NOT use bdsm1 and bdsm2 at the same time.
+    DEBUG ((DEBUG_ERROR, "%a: failed to determine BDSM version, got BDSM1 @ 0x%x, BDSM2 @ 0x%x\n",
+      __FUNCTION__, (UINT64)bdsmAddr1, (UINT64)bdsmAddr2));
+  }
+  if (bdsmAddr2) {
+    DEBUG ((DEBUG_INFO, "%a: detected BDSM2 @ 0x%x\n",
+      __FUNCTION__, (UINT64)bdsmAddr2));
+      PciInfo->BDSMType = BDSM_TYPE_GEN2;
+  }
+  if (bdsmAddr1) {
+    DEBUG ((DEBUG_INFO, "%a: detected BDSM1 @ 0x%x\n",
+      __FUNCTION__, (UINT64)bdsmAddr1));
+      PciInfo->BDSMType = BDSM_TYPE_GEN1;
+  }
+  return EFI_SUCCESS;
+}
 
 /**
   Format and get the debug name of a CANDIDATE_PCI_INFO structure.
@@ -391,7 +457,7 @@ SetupStolenMemory (
   Status = PciIo->Pci.Write (
                         PciIo,
                         EfiPciIoWidthUint32,
-                        ASSIGNED_IGD_PCI_BDSM_OFFSET,
+                        PciInfo->BDSMType == BDSM_TYPE_GEN1 ? ASSIGNED_IGD_PCI_BDSM1_OFFSET : ASSIGNED_IGD_PCI_BDSM2_OFFSET,
                         1,                            // Count
                         &Address
                         );
@@ -452,6 +518,13 @@ PciIoNotify (
         PciInfo.ClassCode[2] != PCI_CLASS_DISPLAY ||
         PciInfo.ClassCode[1] != PCI_CLASS_DISPLAY_VGA ||
         PciInfo.ClassCode[0] != PCI_IF_VGA_VGA) {
+      continue;
+    }
+
+    Status = InitBdsmInfo (PciIo, &PciInfo);
+    if (EFI_ERROR (Status)) {
+      DEBUG ((DEBUG_ERROR, "%a: InitBdsmInfo (PciIo@%p): %r\n", __FUNCTION__,
+        (VOID *)PciIo, Status));
       continue;
     }
 
