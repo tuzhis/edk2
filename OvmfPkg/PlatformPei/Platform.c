@@ -230,6 +230,51 @@ ReserveEmuVariableNvStore (
   ASSERT_RETURN_ERROR (PcdStatus);
 }
 
+#define INTEL_PCI_VENDOR_ID 0x8086
+#define PCI_BUS_NUM_IGD     0
+#define PCI_DEV_NUM_IGD     2
+#define PCI_FUNC_NUM_IGD    0
+
+VOID
+ReserveIgdStolen (
+  )
+{
+  UINT16 VendorId = PciRead16 (PCI_LIB_ADDRESS (PCI_BUS_NUM_IGD, PCI_DEV_NUM_IGD, PCI_FUNC_NUM_IGD, PCI_VENDOR_ID_OFFSET));
+  UINT8 Class = PciRead8 (PCI_LIB_ADDRESS (PCI_BUS_NUM_IGD, PCI_DEV_NUM_IGD, PCI_FUNC_NUM_IGD, PCI_CLASSCODE_OFFSET + 2));
+
+  if (VendorId == INTEL_PCI_VENDOR_ID && Class == PCI_CLASS_DISPLAY) {
+    EFI_STATUS FwCfgStatus = 0;
+    FIRMWARE_CONFIG_ITEM FwCfgItem;
+    UINTN                FwCfgItemSize;
+    UINT64 StolenBase = 0;
+    UINT64 StolenSize = 0;
+
+    FwCfgStatus = QemuFwCfgFindFile ("etc/igd-dsm-base", &FwCfgItem, &FwCfgItemSize);
+    if (EFI_ERROR (FwCfgStatus) || FwCfgItemSize != sizeof(StolenBase)) {
+        return;
+    }
+    QemuFwCfgSelectItem (FwCfgItem);
+    QemuFwCfgReadBytes (FwCfgItemSize, &StolenBase);
+
+    FwCfgStatus = QemuFwCfgFindFile ("etc/igd-dsm-size", &FwCfgItem, &FwCfgItemSize);
+    if (EFI_ERROR (FwCfgStatus) || FwCfgItemSize != sizeof(StolenSize)) {
+        return;
+    }
+    QemuFwCfgSelectItem (FwCfgItem);
+    QemuFwCfgReadBytes (FwCfgItemSize, &StolenSize);
+
+    if (StolenBase && StolenSize) {
+      BuildMemoryAllocationHob (
+        StolenBase,
+        StolenSize,
+        EfiReservedMemoryType
+        );
+
+      DEBUG ((DEBUG_INFO, "IGD stolen memory at %llx, size %x\n", StolenBase, StolenSize));
+    }
+  }
+}
+
 STATIC
 VOID
 Q35BoardVerification (
@@ -316,6 +361,8 @@ InitializePlatform (
   PlatformInfoHob->DefaultMaxCpuNumber = PcdGet32 (PcdCpuMaxLogicalProcessorNumber);
 
   PlatformDebugDumpCmos ();
+
+  ReserveIgdStolen ();
 
   if (QemuFwCfgS3Enabled ()) {
     DEBUG ((DEBUG_INFO, "S3 support was detected on QEMU\n"));
