@@ -36,6 +36,7 @@ typedef struct {
   UINTN  Device;
   UINTN  Function;
   UINTN  BDSMType;
+  UINTN  BDSMAddr;
   CHAR8  Name[sizeof "0000:00:02.0"];
 } CANDIDATE_PCI_INFO;
 
@@ -141,12 +142,12 @@ InitBdsmInfo (
 {
   EFI_STATUS Status;
   // read host bdsmAddr
-  UINTN bdsmAddr2, bdsmAddr1;
+  UINTN bdsmAddr2 = 0, bdsmAddr1 = 0;
   Status = PciIo->Pci.Read (
                     PciIo,
-                    EfiPciIoWidthUint16,
+                    EfiPciIoWidthUint32,
                     ASSIGNED_IGD_PCI_BDSM2_OFFSET,
-                    2,                    // Count
+                    1,                    // Count
                     &bdsmAddr2
                     );
   if (EFI_ERROR (Status)) {
@@ -154,9 +155,9 @@ InitBdsmInfo (
   }
   Status = PciIo->Pci.Read (
                     PciIo,
-                    EfiPciIoWidthUint16,
+                    EfiPciIoWidthUint32,
                     ASSIGNED_IGD_PCI_BDSM1_OFFSET,
-                    2,                    // Count
+                    1,                    // Count
                     &bdsmAddr1
                     );
   if (EFI_ERROR (Status)) {
@@ -171,11 +172,13 @@ InitBdsmInfo (
     DEBUG ((DEBUG_INFO, "%a: detected BDSM2 @ 0x%x\n",
       __FUNCTION__, (UINT64)bdsmAddr2));
       PciInfo->BDSMType = BDSM_TYPE_GEN2;
+      PciInfo->BDSMAddr = bdsmAddr2;
   }
   if (bdsmAddr1) {
     DEBUG ((DEBUG_INFO, "%a: detected BDSM1 @ 0x%x\n",
       __FUNCTION__, (UINT64)bdsmAddr1));
       PciInfo->BDSMType = BDSM_TYPE_GEN1;
+      PciInfo->BDSMAddr = bdsmAddr1;
   }
   return EFI_SUCCESS;
 }
@@ -434,16 +437,42 @@ SetupStolenMemory (
   }
   BdsmPages = EFI_SIZE_TO_PAGES (mBdsmSize);
 
-  Status = Allocate32BitAlignedPagesWithType (
-             EfiReservedMemoryType,
-             BdsmPages,
-             EFI_SIZE_TO_PAGES ((UINTN)ASSIGNED_IGD_BDSM_ALIGN),
-             &Address
-             );
-  if (EFI_ERROR (Status)) {
-    DEBUG ((DEBUG_ERROR, "%a: %a: failed to allocate stolen memory: %r\n",
-      __FUNCTION__, GetPciName (PciInfo), Status));
-    return Status;
+  if (PciInfo->BDSMType == BDSM_TYPE_GEN2) {
+    /**
+      As pcie configuration register at ASSIGNED_IGD_PCI_BDSM2_OFFSET(0xC0) is not WRITEABLE
+      we have to use unallocated memory at the same address of host,
+      which protentially cound be corrupted by other devices, and may cause system crash before loading graphics driver,
+      but it is the only way to get boot screen on newer platforms.
+    **/
+    Address = PciInfo->BDSMAddr - 1;
+    Status = gBS->AllocatePages (
+                AllocateAddress,
+                EfiReservedMemoryType,
+                BdsmPages,
+                &Address
+                );
+    if (EFI_ERROR (Status)) {
+      DEBUG ((DEBUG_WARN, "%a: %a: failed to allocate stolen memory @ 0x%x, got error %r\n",
+        __FUNCTION__, GetPciName (PciInfo), Address, Status));
+      DEBUG ((DEBUG_WARN, "%a: %a: continue with unallocated memory region, may damage system stabilicy\n",
+      __FUNCTION__, GetPciName (PciInfo)));
+      Address = PciInfo->BDSMAddr - 1;
+    } else {
+      DEBUG((DEBUG_INFO, "%a: %a: successfully allocated stolen memory @ 0x%x, size 0x%x\n",
+        __FUNCTION__, GetPciName (PciInfo), Address, (UINT64)mBdsmSize));
+    }
+  } else {
+    Status = Allocate32BitAlignedPagesWithType (
+              EfiReservedMemoryType,
+              BdsmPages,
+              EFI_SIZE_TO_PAGES ((UINTN)ASSIGNED_IGD_BDSM_ALIGN),
+              &Address
+              );
+    if (EFI_ERROR (Status)) {
+      DEBUG ((DEBUG_ERROR, "%a: %a: failed to allocate stolen memory: %r\n",
+        __FUNCTION__, GetPciName (PciInfo), Status));
+      return Status;
+    }
   }
 
   //
@@ -454,13 +483,15 @@ SetupStolenMemory (
   //
   // Write address of stolen memory to PCI config space.
   //
-  Status = PciIo->Pci.Write (
-                        PciIo,
-                        EfiPciIoWidthUint32,
-                        PciInfo->BDSMType == BDSM_TYPE_GEN1 ? ASSIGNED_IGD_PCI_BDSM1_OFFSET : ASSIGNED_IGD_PCI_BDSM2_OFFSET,
-                        1,                            // Count
-                        &Address
-                        );
+  if (PciInfo->BDSMType == BDSM_TYPE_GEN1) {
+    Status = PciIo->Pci.Write (
+                          PciIo,
+                          EfiPciIoWidthUint32,
+                          ASSIGNED_IGD_PCI_BDSM1_OFFSET,
+                          1,                            // Count
+                          &Address
+                          );
+  }
   if (EFI_ERROR (Status)) {
     DEBUG ((DEBUG_ERROR, "%a: %a: failed to write stolen memory address: %r\n",
       __FUNCTION__, GetPciName (PciInfo), Status));
